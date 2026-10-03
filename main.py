@@ -2,6 +2,7 @@
 # Old rule/guard prediction system removed. Level system remains active.
 # New prediction engine: pattern.py online neural AI trained on number + size + colour.
 
+import hmac
 import json
 import logging
 import os
@@ -97,14 +98,10 @@ HISTORY_API_BACKOFF_SEC = int(os.getenv("HISTORY_API_BACKOFF_SEC", "300") or 300
 CLOCK_FALLBACK_ENABLE = False
 CLOCK_FALLBACK_AFTER_SEC = int(os.getenv("CLOCK_FALLBACK_AFTER_SEC", "45") or 45)
 
-FIREBASE_AUTOBET_URL = os.getenv(
-    "FIREBASE_AUTOBET_URL", "https://auto-bet-pro-default-rtdb.firebaseio.com"
-)
-FIREBASE_AUTOBET_SECRET = os.getenv("FIREBASE_AUTOBET_SECRET", "")
-FIREBASE_URL = os.getenv(
-    "FIREBASE_URL", "https://drago-predictor-default-rtdb.firebaseio.com"
-)
-FIREBASE_SECRET = os.getenv("FIREBASE_SECRET", "")
+FIREBASE_AUTOBET_URL = os.getenv("FIREBASE_AUTOBET_URL", "").strip()
+FIREBASE_AUTOBET_SECRET = os.getenv("FIREBASE_AUTOBET_SECRET", "").strip()
+FIREBASE_URL = os.getenv("FIREBASE_URL", "").strip()
+FIREBASE_SECRET = os.getenv("FIREBASE_SECRET", "").strip()
 
 PORT = int(os.getenv("PORT", os.getenv("SERVER_PORT", "30252")))
 VPS_SECRET = (os.getenv("VPS_SECRET") or os.getenv("DRAGO_VPS_SECRET") or "").strip()
@@ -368,10 +365,10 @@ def record_hourly_result(correct, consec_after):
 
 
 def fb_put(base, path, data, secret=""): 
-    if not base:
+    if not base or not secret:
         return
     try:
-        url = f"{base.rstrip('/')}/{path}.json" + (f"?auth={secret}" if secret else "")
+        url = f"{base.rstrip('/')}/{path}.json?auth={secret}"
         response = requests.put(url, json=data, timeout=15)
         if response.status_code not in (200, 201):
             log.warning("firebase PUT %s -> %s %s", path, response.status_code, response.text[:160])
@@ -380,20 +377,20 @@ def fb_put(base, path, data, secret=""):
 
 
 def fb_delete(base, path, secret=""):
-    if not base:
+    if not base or not secret:
         return
     try:
-        url = f"{base.rstrip('/')}/{path}.json" + (f"?auth={secret}" if secret else "")
+        url = f"{base.rstrip('/')}/{path}.json?auth={secret}"
         requests.delete(url, timeout=20)
     except Exception as exc:
         log.error("firebase DELETE error: %s", exc)
 
 
 def fb_get(base, path, secret=""):
-    if not base:
+    if not base or not secret:
         return None
     try:
-        url = f"{base.rstrip('/')}/{path}.json" + (f"?auth={secret}" if secret else "")
+        url = f"{base.rstrip('/')}/{path}.json?auth={secret}"
         response = requests.get(url, timeout=15)
         if response.status_code != 200:
             log.warning("firebase GET %s -> %s %s", path, response.status_code, response.text[:160])
@@ -665,19 +662,78 @@ def record_draw_row(period, number, color=None):
         log.warning("draw store save: %s", exc)
 
 
-def require_vps_auth(request):
+_auth_fail_lock = threading.Lock()
+_auth_failures = {}  # ip -> [count, window_start_ts]
+AUTH_FAIL_MAX = 20
+AUTH_FAIL_WINDOW_SEC = 300
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    return str(getattr(request.client, "host", None) or "unknown")
+
+
+def _check_auth_rate_limit(ip: str) -> bool:
+    now = time.time()
+    with _auth_fail_lock:
+        rec = _auth_failures.get(ip)
+        if rec and now - rec[1] < AUTH_FAIL_WINDOW_SEC:
+            if rec[0] >= AUTH_FAIL_MAX:
+                return False
+        if len(_auth_failures) > 5000:
+            expired = [k for k, v in _auth_failures.items() if now - v[1] >= AUTH_FAIL_WINDOW_SEC]
+            for k in expired:
+                _auth_failures.pop(k, None)
+    return True
+
+
+def _record_auth_failure(ip: str):
+    now = time.time()
+    with _auth_fail_lock:
+        rec = _auth_failures.get(ip)
+        if not rec or now - rec[1] >= AUTH_FAIL_WINDOW_SEC:
+            _auth_failures[ip] = [1, now]
+        else:
+            rec[0] += 1
+
+
+def _safe_eq(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    try:
+        return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def _has_valid_vps_auth(request: Request) -> bool:
     if not VPS_SECRET:
-        raise HTTPException(status_code=503, detail="VPS_SECRET not configured")
+        return False
     key = (request.headers.get("x-vps-key") or "").strip()
     if not key:
         auth = (request.headers.get("authorization") or "").strip()
         if auth.lower().startswith("bearer "):
             key = auth[7:].strip()
-    if key != VPS_SECRET:
+    return _safe_eq(key, VPS_SECRET)
+
+
+def require_vps_auth(request: Request):
+    if not VPS_SECRET:
+        raise HTTPException(status_code=503, detail="VPS_SECRET not configured")
+    ip = _client_ip(request)
+    if not _check_auth_rate_limit(ip):
+        raise HTTPException(status_code=429, detail="Too many failed authentication attempts")
+    if not _has_valid_vps_auth(request):
+        _record_auth_failure(ip)
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _logs_auth_ok(request, key=""):
+def _logs_auth_ok(request: Request, key=""):
+    ip = _client_ip(request)
+    if not _check_auth_rate_limit(ip):
+        return False
     candidates = []
     if str(key).strip():
         candidates.append(str(key).strip())
@@ -687,10 +743,13 @@ def _logs_auth_ok(request, key=""):
     auth = (request.headers.get("authorization") or "").strip()
     if auth.lower().startswith("bearer "):
         candidates.append(auth[7:].strip())
-    return any(
-        candidate and ((VPS_SECRET and candidate == VPS_SECRET) or (LOGS_SECRET and candidate == LOGS_SECRET))
+    ok = any(
+        candidate and (_safe_eq(candidate, VPS_SECRET) or _safe_eq(candidate, LOGS_SECRET))
         for candidate in candidates
     )
+    if not ok:
+        _record_auth_failure(ip)
+    return ok
 
 
 def _update_data_source(ok, http_status=None, error=""):
@@ -1631,17 +1690,50 @@ async def lifespan(app):
     pattern.save_state()
 
 
-app = FastAPI(title="DRAGO AI WinGo 30s", lifespan=lifespan)
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in (
+        os.getenv(
+            "ALLOWED_ORIGINS",
+            "https://dragopredictor.onrender.com,https://dragopredictor.vercel.app,http://localhost:3000,http://localhost:5173",
+        )
+    ).split(",")
+    if o.strip()
+]
+
+app = FastAPI(
+    title="DRAGO AI WinGo 30s",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-VPS-Key", "Accept"],
 )
 
 
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.get("/")
-def root():
+def root(request: Request):
+    if not _has_valid_vps_auth(request):
+        return {
+            "app": "DRAGO AI Main",
+            "ok": True,
+            "stream": STREAM_ID,
+        }
     return {
         "app": "DRAGO AI Main",
         "version": VERSION,
@@ -1654,7 +1746,13 @@ def root():
 
 
 @app.get("/health")
-def health():
+def health(request: Request):
+    if not _has_valid_vps_auth(request):
+        with ENGINE.lock:
+            return {
+                "ok": True,
+                "bootstrapped": ENGINE.bootstrapped,
+            }
     with ENGINE.lock:
         return {
             "ok": True,
@@ -1704,8 +1802,9 @@ def get_history(request: Request, limit: int = 100000):
 
 
 @app.get("/wingo30s.json")
-def wingo30s_json(limit: int = 100000):
-    """Backward-compatible public JSON cache: data + savedAt, max 1 lakh rows."""
+def wingo30s_json(request: Request, limit: int = 100000):
+    """Authenticated JSON cache: data + savedAt, max 1 lakh rows."""
+    require_vps_auth(request)
     limit = max(1, min(int(limit or 100000), DRAW_STORE_MAX))
     items = load_draw_store()[:limit]
     payload = _draw_store_payload(items)
@@ -1824,7 +1923,7 @@ def source_status(request: Request):
     }
 
 
-@app.get("/api/source/resync")
+@app.api_route("/api/source/resync", methods=["GET", "POST"])
 def source_resync(request: Request, limit: int = 10000):
     require_vps_auth(request)
     records = fetch_history_api(max(1, min(int(limit or 10000), 10000)), force=True)
@@ -1837,7 +1936,7 @@ def source_resync(request: Request, limit: int = 10000):
     return {"success": True, "records": len(records), "last_period": ENGINE.last_period, "latest": ENGINE.latest}
 
 
-@app.get("/api/level/reset")
+@app.api_route("/api/level/reset", methods=["GET", "POST"])
 def level_reset(request: Request, clear_pending: int = 1, publish: int = 1):
     """Manual repair endpoint for polluted live state (for example old fake fallback L2)."""
     require_vps_auth(request)
