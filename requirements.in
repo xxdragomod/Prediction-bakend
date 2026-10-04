@@ -1,0 +1,4 @@
+# Direct runtime dependencies; requirements.txt is the hash-locked deployment file.
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+requests==2.34.2

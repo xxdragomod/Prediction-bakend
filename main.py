@@ -12,7 +12,26 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
+
+
+def strip_api_key_query(url):
+    """Remove credentials from configured URLs before requests or status data expose them."""
+    raw = str(url or "")
+    try:
+        parsed = urlparse(raw)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if not any(key.casefold() == "api_key" for key in query):
+            return raw
+        safe_query = [
+            (key, value)
+            for key, values in query.items()
+            if key.casefold() != "api_key"
+            for value in values
+        ]
+        return parsed._replace(query=urlencode(safe_query), fragment="").geturl()
+    except Exception:
+        return raw
 
 
 def load_dotenv_file():
@@ -28,8 +47,9 @@ def load_dotenv_file():
             key = key.strip()
             value = value.strip().strip('"').strip("'")
             if key:
-                # Keep current behaviour: local .env is authoritative for this project.
-                os.environ[key] = value
+                # Host-injected secrets must take precedence over local development files.
+                if key not in os.environ:
+                    os.environ[key] = value
         return str(env_path)
     return None
 
@@ -53,21 +73,26 @@ VERSION = "v55-ai-v10-neural-loss-brain"
 # had API_URL/SOURCE_API keep working "jaise pehle tha".
 DEFAULT_DRAGO_HISTORY_API_URL = "https://dragopredictor.onrender.com/v1/wingo30s/history"
 DEFAULT_DIRECT_HISTORY_API_URL = "https://draw.ar-lottery02.com/WinGo/WinGo_30S/GetHistoryIssuePage.json"
-HISTORY_API_URL = (
+HISTORY_API_URL = strip_api_key_query((
     os.getenv("HISTORY_API_URL")
     or os.getenv("API_URL")
     or os.getenv("SOURCE_API")
     or DEFAULT_DRAGO_HISTORY_API_URL
-).strip()
-HISTORY_FALLBACK_URLS = (os.getenv("HISTORY_FALLBACK_URLS") or DEFAULT_DIRECT_HISTORY_API_URL).strip()
+).strip())
+HISTORY_FALLBACK_URLS = ",".join(
+    strip_api_key_query(item.strip())
+    for item in (os.getenv("HISTORY_FALLBACK_URLS") or DEFAULT_DIRECT_HISTORY_API_URL).split(",")
+    if item.strip()
+)
 # Separate fast live source for polling. Bootstrap can use 10K DRAGO history,
 # but live prediction must not wait 28s for that source or prediction appears 1 period behind.
-LIVE_HISTORY_API_URL = (os.getenv("LIVE_HISTORY_API_URL") or DEFAULT_DIRECT_HISTORY_API_URL).strip()
-LIVE_HISTORY_FALLBACK_URLS = (os.getenv("LIVE_HISTORY_FALLBACK_URLS") or "").strip()
-HISTORY_API_KEY = os.getenv(
-    "HISTORY_API_KEY",
-    "drago_d5b31311d951cec50aa1894ef614ebc73c039e0bacaf44c8",
-).strip()
+LIVE_HISTORY_API_URL = strip_api_key_query((os.getenv("LIVE_HISTORY_API_URL") or DEFAULT_DIRECT_HISTORY_API_URL).strip())
+LIVE_HISTORY_FALLBACK_URLS = ",".join(
+    strip_api_key_query(item.strip())
+    for item in (os.getenv("LIVE_HISTORY_FALLBACK_URLS") or "").split(",")
+    if item.strip()
+)
+HISTORY_API_KEY = (os.getenv("HISTORY_API_KEY") or "").strip()
 BOOTSTRAP_HISTORY_LIMIT = int(os.getenv("BOOTSTRAP_HISTORY_LIMIT", "10000") or 10000)
 POLL_HISTORY_LIMIT = int(os.getenv("POLL_HISTORY_LIMIT", "20") or 20)
 POLL_SEC = int(os.getenv("POLL_SEC", "3") or 3)
@@ -107,11 +132,8 @@ PORT = int(os.getenv("PORT", os.getenv("SERVER_PORT", "30252")))
 VPS_SECRET = (os.getenv("VPS_SECRET") or os.getenv("DRAGO_VPS_SECRET") or "").strip()
 LOGS_SECRET = (os.getenv("LOGS_SECRET") or os.getenv("MISTAKES_LOG_KEY") or "").strip()
 
-# Existing hardcoded Telegram fallback retained as requested.
-TELEGRAM_BOT_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN")
-    or "8782822978:AAEitqI-CdxbiAN3-55Ltf72i79BpIjBeaA"
-).strip()
+# Telegram credentials must be supplied through the host environment; there is no source fallback.
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "6656009938").strip()
 TELEGRAM_LEVEL_ALERT_AT = int(os.getenv("TELEGRAM_LEVEL_ALERT_AT", "5") or 5)
 TELEGRAM_COMMANDS_ENABLED = (os.getenv("TELEGRAM_COMMANDS_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
@@ -797,12 +819,9 @@ def _api_params(url, limit):
     query = parse_qs(parsed.query)
     host = (parsed.netloc or "").lower()
     params = {}
-    # DRAGO/custom APIs accept limit + api_key.  The direct WinGo endpoint usually
-    # rejects unnecessary bot-looking params, so keep it clean.
-    if "dragopredictor" in host or "api_key" in query or "limit" in query:
+    # Limits are query data; credentials are sent only in headers (never URLs/logs).
+    if "dragopredictor" in host or "limit" in query:
         params["limit"] = int(limit)
-        if HISTORY_API_KEY and "api_key" not in query:
-            params["api_key"] = HISTORY_API_KEY
     elif "ar-lottery" not in host:
         params["limit"] = int(limit)
     return params
@@ -819,7 +838,11 @@ def _api_headers(url):
             "Origin": origin,
             "Cache-Control": "no-cache",
         }
-    return {"User-Agent": "DRAGO-AI-Server/4.0", "Accept": "application/json"}
+    headers = {"User-Agent": "DRAGO-AI-Server/4.0", "Accept": "application/json"}
+    # Only attach the private developer key to the intended DRAGO API host.
+    if host == "dragopredictor.onrender.com" and HISTORY_API_KEY:
+        headers["X-API-Key"] = HISTORY_API_KEY
+    return headers
 
 
 def _extract_items(payload):
